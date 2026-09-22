@@ -4,6 +4,7 @@
   "config.minecanvas.local_volume": "Local volume",
   "config.minecanvas.render_video": "Video",
   "config.minecanvas.actionbar_timeline": "Timeline",
+  "config.minecanvas.prefetch_videos": "Auto-download",
   "config.minecanvas.max_cache_gib": "Maximum media cache",
   "config.minecanvas.enabled": "enabled",
   "config.minecanvas.disabled": "disabled",

@@ -4,6 +4,7 @@
   "config.minecanvas.local_volume": "Локальная громкость",
   "config.minecanvas.render_video": "Видео",
   "config.minecanvas.actionbar_timeline": "Таймлайн",
+  "config.minecanvas.prefetch_videos": "Автозагрузка",
   "config.minecanvas.max_cache_gib": "Максимальный медиакэш",
   "config.minecanvas.enabled": "включено",
   "config.minecanvas.disabled": "выключено",

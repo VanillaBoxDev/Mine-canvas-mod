@@ -39,7 +39,7 @@ public final class MineCanvasConfigScreen extends Screen {
         int headerHeight = Math.max(1, Math.min(45, panelHeight * 15 / 100));
         int footerHeight = Math.max(1, Math.min(36, panelHeight * 12 / 100));
         int gap = panelHeight >= 320 ? 3 : panelHeight >= 180 ? 1 : 0;
-        int rows = 4;
+        int rows = 5;
         int rowHeight = Math.max(1, Math.min(26, (panelHeight - headerHeight - footerHeight - gap * (rows - 1)) / rows));
         panelHeight = Math.min(panelHeight, headerHeight + rowHeight * rows + gap * (rows - 1) + footerHeight);
         panelY = (height - panelHeight) / 2;
@@ -58,6 +58,10 @@ public final class MineCanvasConfigScreen extends Screen {
                 contentWidth - leftWidth - halfGap, rowHeight, font,
                 Component.translatable("config.minecanvas.actionbar_timeline"), ConfigWidgets.Icon.TIMELINE,
                 config.actionbarTimeline, value -> config.actionbarTimeline = value));
+        y += rowHeight + gap;
+        addRenderableWidget(new ConfigWidgets.Toggle(contentX, y, contentWidth, rowHeight, font,
+                Component.translatable("config.minecanvas.prefetch_videos"), ConfigWidgets.Icon.DOWNLOAD,
+                config.prefetchVideos, value -> config.prefetchVideos = value));
         y += rowHeight + gap;
         addRenderableWidget(new ConfigWidgets.CycleBox<>(contentX, y, contentWidth, rowHeight, font,
                 Component.translatable("config.minecanvas.max_cache_gib"), ConfigWidgets.Icon.DOWNLOAD,

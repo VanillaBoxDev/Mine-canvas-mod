@@ -15,6 +15,7 @@ public final class MineCanvasClientConfig {
     public int localVolumePercent = 100;
     public boolean renderVideo = true;
     public boolean actionbarTimeline = true;
+    public boolean prefetchVideos = true;
     public int maxCacheGiB = 16;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();

@@ -2,6 +2,7 @@ package org.sawiq.minecanvas.fabric.client.video;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.phys.Vec3;
+import org.sawiq.minecanvas.fabric.client.config.MineCanvasClientConfig;
 import org.sawiq.minecanvas.fabric.client.state.ScreenState;
 
 import java.util.Comparator;
@@ -27,6 +28,10 @@ public final class VideoPrefetcher {
 
     public static void tick(Minecraft client, Vec3 playerPos) {
         if (playerPos == null) return;
+        if (!MineCanvasClientConfig.get().prefetchVideos) {
+            if (!ENTRIES.isEmpty()) cancelAll();
+            return;
+        }
         double radius2 = (double) PREFETCH_RADIUS_BLOCKS * PREFETCH_RADIUS_BLOCKS;
         for (VideoScreen screen : VideoScreenManager.all()) {
             ScreenState state = screen.state();
