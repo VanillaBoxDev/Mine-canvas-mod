@@ -1,0 +1,14 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven {
+            url = "https://maven.fabricmc.net/"
+        }
+    }
+}
+
+rootProject.name = "mine-canvas-mod"
+
+include("mine-canvas-fabric-1.21.11")
+include("mine-canvas-fabric-mc26.2")
+include("mine-canvas-fabric-mc26.3")

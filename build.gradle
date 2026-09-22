@@ -1,0 +1,54 @@
+plugins {
+    id 'base'
+}
+
+allprojects {
+    repositories {
+        mavenCentral()
+    }
+}
+
+// Mirror the final shippable mod jars into a single
+// top-level build/libs/ folder so they can be grabbed without digging
+// into subproject build/libs/ folders. Modern Fabric uses `jar`;
+// Fabric 1.21.11 uses Loom's `remapJar`.
+// Unmanaged copy: a plain task whose destination is NOT registered as a
+// Gradle output. With a `Copy` / `Sync` task Gradle would treat
+// build/libs/ as owned by the task and prune files it did not produce.
+tasks.register('collectJars') {
+    group = 'build'
+    description = 'Copies the fabric mod jars into <root>/build/libs'
+
+    def modernFabricJars = subprojects.findAll { it.name.startsWith('mine-canvas-fabric-mc') }
+            .collect { it.tasks.named('jar') }
+    def fabric12111Jar = project(':mine-canvas-fabric-1.21.11').tasks.named('remapJar')
+    dependsOn modernFabricJars, fabric12111Jar
+
+    doLast {
+        copy {
+            from modernFabricJars
+            from fabric12111Jar
+            into layout.buildDirectory.dir('libs')
+            duplicatesStrategy = DuplicatesStrategy.INCLUDE
+        }
+    }
+}
+
+tasks.named('assemble') {
+    dependsOn 'collectJars'
+}
+
+// Also kick off collectJars whenever the user invokes a subproject's
+// jar-producing task directly (e.g. `gradlew :mine-canvas-fabric-mc26.2:build`).
+subprojects.findAll { it.name.startsWith('mine-canvas-fabric-mc') }.each { modernFabricProject ->
+    modernFabricProject.afterEvaluate {
+        modernFabricProject.tasks.named('jar') {
+            finalizedBy ':collectJars'
+        }
+    }
+}
+project(':mine-canvas-fabric-1.21.11').afterEvaluate {
+    project(':mine-canvas-fabric-1.21.11').tasks.named('remapJar') {
+        finalizedBy ':collectJars'
+    }
+}

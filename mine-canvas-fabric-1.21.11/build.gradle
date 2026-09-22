@@ -1,0 +1,75 @@
+plugins {
+    id "net.fabricmc.fabric-loom-remap" version "1.17.20"
+    id "maven-publish"
+}
+
+version = rootProject.mod_version
+group = project.maven_group
+
+repositories {
+    maven { url = "https://maven.terraformersmc.com/releases/" }
+    maven { url = "https://maven.maxhenkel.de/repository/public" }
+}
+
+tasks.named('remapJar') {
+    archiveFileName = "mine-canvas-fabric-${project.version}-mc${project.minecraft_version}.jar"
+}
+
+sourceSets {
+    main {
+        java.srcDirs = ['src/main/java', rootProject.file('mine-canvas-fabric-common/src/main/java')]
+        resources.srcDirs = ['src/main/resources', rootProject.file('mine-canvas-fabric-common/src/main/resources')]
+    }
+    test {
+        java.srcDirs = ['src/test/java', rootProject.file('mine-canvas-fabric-common/src/test/java')]
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Java-часть
+    include "org.bytedeco:javacv:1.5.14"
+    implementation "org.bytedeco:javacv:1.5.14"
+    include "org.bytedeco:javacpp:1.5.14"
+    implementation "org.bytedeco:javacpp:1.5.14"
+    include "org.bytedeco:ffmpeg:8.1.2-1.5.14"
+    implementation "org.bytedeco:ffmpeg:8.1.2-1.5.14"
+
+    // Нативки под все три клиентские ОС (не-gpl: только декодирование)
+    for (def platform in ["windows-x86_64", "linux-x86_64", "macosx-arm64", "macosx-x86_64"]) {
+        include "org.bytedeco:javacpp:1.5.14:${platform}"
+        implementation "org.bytedeco:javacpp:1.5.14:${platform}"
+        include "org.bytedeco:ffmpeg:8.1.2-1.5.14:${platform}"
+        implementation "org.bytedeco:ffmpeg:8.1.2-1.5.14:${platform}"
+    }
+
+    modCompileOnly "com.terraformersmc:modmenu:17.0.0"
+    compileOnly "de.maxhenkel.voicechat:voicechat-api:2.6.24"
+
+    testImplementation "org.junit.jupiter:junit-jupiter:5.13.4"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.13.4"
+}
+
+tasks.named("test") {
+    useJUnitPlatform()
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "mine-canvas",
+  "version": "${version}",
+  "name": "Mine-canvas",
+  "description": "Клиентский мод для просмотра видео на экранах в Minecraft. Требует плагин Mine-canvas для Paper на сервере. Поддерживает RuTube и VK: скачивает видео в кэш и играет его на экранах синхронно с сервером.",
+  "authors": ["AmadoMuerte"],
+  "icon": "assets/mine-canvas/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "main": ["org.sawiq.minecanvas.fabric.MineCanvasMod"],
+    "client": ["org.sawiq.minecanvas.fabric.client.MineCanvasClient"],
+    "modmenu": ["org.sawiq.minecanvas.fabric.client.config.MineCanvasModMenu"],
+    "voicechat": ["org.sawiq.minecanvas.fabric.client.video.voicechat.MineCanvasVoicechatPlugin"]
+  },
+  "mixins": [
+    "mine-canvas.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loaderVersion}",
+    "fabric-api": ">=${fabricApiVersion}",
+    "minecraft": "~${minecraftVersion}",
+    "java": ">=25"
+  },
+  "recommends": {
+    "modmenu": "*",
+    "voicechat_api": ">=2.6.0"
+  }
+}
