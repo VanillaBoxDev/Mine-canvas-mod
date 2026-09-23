@@ -28,6 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /** FFmpeg only receives completed local cache files. */
 public final class VideoPlayer {
@@ -50,6 +51,7 @@ public final class VideoPlayer {
     private static final Map<String, Object> LOCKS = new ConcurrentHashMap<>();
     private static final Map<String, Path> READY = new ConcurrentHashMap<>();
     private static final Map<Path, AtomicInteger> IN_USE = new ConcurrentHashMap<>();
+    private static final Map<Path, Boolean> WRITING = new ConcurrentHashMap<>();
     private static final AtomicBoolean AUDIO_UNAVAILABLE_LOGGED = new AtomicBoolean();
     private final FrameSink sink;
     private final Object lifecycleLock = new Object();
@@ -64,6 +66,7 @@ public final class VideoPlayer {
     public boolean start(String url, int blocksW, int blocksH, boolean loop, long seekMs, float gain, int height, Vec3 center, float distance) {
         Path file = cachedFile(url, height);
         if (file == null) return false;
+        sink.onCachedFileUsed(file.toString(), size(file));
         SpatialAudio.Output previousAudio; Thread previousThread; Thread nextThread;
         synchronized (lifecycleLock) {
             this.gain = Math.max(0f, gain);
@@ -99,7 +102,8 @@ public final class VideoPlayer {
         }
     }
 
-    static VideoPrefetcher.PathResult ensureCachedToDisk(String originalUrl, int height, FrameSink sink, BooleanSupplier cancelled) {
+    static VideoPrefetcher.PathResult ensureCachedToDisk(String originalUrl, int height, FrameSink sink,
+                                                         BooleanSupplier cancelled, Consumer<Runnable> setAbort) {
         String key = originalUrl + "#" + height;
         Object lock = LOCKS.computeIfAbsent(key, ignored -> new Object());
         synchronized (lock) {
@@ -109,7 +113,7 @@ public final class VideoPlayer {
                 if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, 0, 0);
                 String url = originalUrl;
                 if (PlatformResolver.isSupportedPlatformUrl(url)) {
-                    PlatformResolver.PlatformResult result = PlatformResolver.resolvePrefetch(url, height, sink);
+                    PlatformResolver.PlatformResult result = PlatformResolver.resolvePrefetch(url, height, sink, cancelled, setAbort);
                     if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, 0, 0);
                     if (!result.isSuccess()) return new VideoPrefetcher.PathResult(null, 0, 0);
                     url = result.directUrl();
@@ -119,7 +123,7 @@ public final class VideoPlayer {
                         READY.put(key, resolved); long size = size(resolved); sink.onDownloadProgressBytes(100, size, size); evict(cacheDir(), resolved); return new VideoPrefetcher.PathResult(resolved, size, size);
                     }
                 }
-                return download(key, url, sink, cancelled);
+                return download(key, url, sink, cancelled, setAbort);
             } catch (Exception ignored) { return new VideoPrefetcher.PathResult(null, 0, 0); }
         }
     }
@@ -137,36 +141,51 @@ public final class VideoPlayer {
         } catch (Exception ignored) { }
         return null;
     }
-    private static VideoPrefetcher.PathResult download(String key, String url, FrameSink sink, BooleanSupplier cancelled) throws Exception {
+    private static VideoPrefetcher.PathResult download(String key, String url, FrameSink sink, BooleanSupplier cancelled,
+                                                       Consumer<Runnable> setAbort) throws Exception {
         if (!(url.startsWith("http://") || url.startsWith("https://"))) return new VideoPrefetcher.PathResult(null, 0, 0);
         Path dir = cacheDir(); Files.createDirectories(dir); String hash = sha256(key);
         Path existing = findCached(dir, hash);
         if (existing != null && validMedia(existing)) { if (!cancelled.getAsBoolean()) READY.put(key, existing); long size = size(existing); sink.onDownloadProgressBytes(100, size, size); return new VideoPrefetcher.PathResult(existing, size, size); }
-        Path part = dir.resolve(hash + ".part"); long resume = Files.isRegularFile(part) ? size(part) : 0;
+        Path part = partialPath(dir, hash); long resume = Files.isRegularFile(part) ? size(part) : 0;
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setConnectTimeout(15_000); connection.setReadTimeout(60_000); connection.setRequestProperty("Accept-Encoding", "identity");
         if (resume > 0) connection.setRequestProperty("Range", "bytes=" + resume + "-");
-        int status = connection.getResponseCode();
-        boolean resumed = resume > 0 && status == HttpURLConnection.HTTP_PARTIAL;
-        if (!resumed && resume > 0) { Files.deleteIfExists(part); resume = 0; }
-        if (status < 200 || status >= 300) return new VideoPrefetcher.PathResult(null, resume, 0);
-        long length = connection.getContentLengthLong(); long total = length < 0 ? 0 : length + (resumed ? resume : 0);
-        String ext = extension(url, connection.getHeaderField("Content-Type")); long written = resume;
-        try (InputStream input = connection.getInputStream(); OutputStream output = Files.newOutputStream(part, StandardOpenOption.CREATE, resumed ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
-            byte[] bytes = new byte[65536]; int read;
-            while ((read = input.read(bytes)) >= 0) {
-                if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, written, total);
-                output.write(bytes, 0, read); written += read;
-                sink.onDownloadProgressBytes(total > 0 ? (int) Math.min(100L, written * 100L / total) : 0, written, total);
+        setAbort.accept(connection::disconnect);
+        long written = resume;
+        try {
+            if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, written, 0);
+            int status = connection.getResponseCode();
+            boolean resumed = resume > 0 && status == HttpURLConnection.HTTP_PARTIAL;
+            if (!resumed && resume > 0) { Files.deleteIfExists(part); resume = 0; written = 0; }
+            if (status < 200 || status >= 300) return new VideoPrefetcher.PathResult(null, written, 0);
+            long length = connection.getContentLengthLong();
+            long total = responseTotalBytes(length, resumed ? resume : 0, connection.getHeaderField("Content-Range"));
+            String ext = extension(url, connection.getHeaderField("Content-Type"));
+            sink.onDownloadStart("minecanvas.prefetch.download");
+            sink.onDownloadProgressBytes(total > 0 ? (int) Math.min(100L, written * 100L / total) : 0, written, total);
+            WRITING.put(part, Boolean.TRUE);
+            try (InputStream input = connection.getInputStream(); OutputStream output = Files.newOutputStream(part, StandardOpenOption.CREATE, resumed ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
+                byte[] bytes = new byte[65536]; int read;
+                while ((read = input.read(bytes)) >= 0) {
+                    if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, written, total);
+                    output.write(bytes, 0, read); written += read;
+                    sink.onDownloadProgressBytes(total > 0 ? (int) Math.min(100L, written * 100L / total) : 0, written, total);
+                }
             }
-        } finally { connection.disconnect(); }
-        if (total > 0 && written != total || !validMedia(part)) { Files.deleteIfExists(part); return new VideoPrefetcher.PathResult(null, written, total); }
-        Path target = dir.resolve(hash + ext);
-        try { Files.move(part, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
-        catch (java.nio.file.AtomicMoveNotSupportedException ignored) { Files.move(part, target, StandardCopyOption.REPLACE_EXISTING); }
-        if (!cancelled.getAsBoolean()) READY.put(key, target);
-        evict(dir, target);
-        return new VideoPrefetcher.PathResult(target, written, total == 0 ? written : total);
+            if (cancelled.getAsBoolean()) return new VideoPrefetcher.PathResult(null, written, total);
+            if (total > 0 && written != total || !validMedia(part)) { Files.deleteIfExists(part); return new VideoPrefetcher.PathResult(null, written, total); }
+            Path target = dir.resolve(hash + ext);
+            try { Files.move(part, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
+            catch (java.nio.file.AtomicMoveNotSupportedException ignored) { Files.move(part, target, StandardCopyOption.REPLACE_EXISTING); }
+            if (!cancelled.getAsBoolean()) READY.put(key, target);
+            evict(dir, target);
+            return new VideoPrefetcher.PathResult(target, written, total == 0 ? written : total);
+        } finally {
+            WRITING.remove(part);
+            setAbort.accept(null);
+            connection.disconnect();
+        }
     }
     private void decode(Path file, int blocksW, int blocksH, boolean loop, long seekMs, Vec3 center, float distance) {
         // Identity of the thread that owns this decode run. stop()+start()
@@ -267,12 +286,23 @@ public final class VideoPlayer {
         } catch (Exception ignored) { return false; }
     }
     private static String extension(String url, String type) { String lower = type == null ? "" : type.toLowerCase(Locale.ROOT); if (lower.contains("webm")) return ".webm"; if (lower.contains("matroska")) return ".mkv"; if (lower.contains("quicktime")) return ".mov"; return ".mp4"; }
-    private static Path findCached(Path dir, String hash) throws Exception { try (var files = Files.walk(dir)) { return files.filter(Files::isRegularFile).filter(path -> path.getFileName().toString().startsWith(hash + ".") && !path.getFileName().toString().endsWith(".part")).findFirst().orElse(null); } }
-    private static Path cacheDir() { try { return FabricLoader.getInstance().getGameDir().resolve("mine-canvas-cache"); } catch (Exception ignored) { return Path.of("mine-canvas-cache"); } }
+    static Path findCached(Path dir, String hash) throws Exception { try (var files = Files.walk(dir)) { return files.filter(Files::isRegularFile).filter(path -> path.getFileName().toString().startsWith(hash + ".") && !path.getFileName().toString().endsWith(".part")).findFirst().orElse(null); } }
+    static Path cacheDir() { try { return FabricLoader.getInstance().getGameDir().resolve("mine-canvas-cache"); } catch (Exception ignored) { return Path.of("mine-canvas-cache"); } }
+    static Path partialPath(Path dir, String hash) { return dir.resolve(hash + ".part"); }
+    static long responseTotalBytes(long contentLength, long resumedBytes, String contentRange) {
+        if (contentRange != null) {
+            int slash = contentRange.lastIndexOf('/');
+            if (slash >= 0 && slash + 1 < contentRange.length()) {
+                try { return Math.max(0L, Long.parseLong(contentRange.substring(slash + 1).trim())); }
+                catch (NumberFormatException ignored) { }
+            }
+        }
+        return contentLength < 0 ? 0 : contentLength + Math.max(0L, resumedBytes);
+    }
     private static long size(Path path) { try { return Files.size(path); } catch (Exception ignored) { return 0; } }
     private static String sha256(String value) { try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); } catch (Exception ignored) { return Integer.toHexString(value.hashCode()); } }
     private static void evict(Path dir, Path keep) { long limit = (long) MineCanvasClientConfig.get().maxCacheGiB << 30; try (var files = Files.walk(dir)) { var list = files.filter(Files::isRegularFile).filter(path -> !path.getFileName().toString().endsWith(".part")).sorted(Comparator.comparingLong(VideoPlayer::modified)).toList(); long used = list.stream().mapToLong(VideoPlayer::size).sum(); Path kept = keep == null ? null : keep.toAbsolutePath().normalize(); for (Path path : list) { if (used <= limit) break; if (kept != null && path.toAbsolutePath().normalize().equals(kept)) continue; AtomicInteger inUse = IN_USE.get(path); if (inUse != null && inUse.get() > 0) continue; long bytes = size(path); if (Files.deleteIfExists(path)) used -= bytes; } } catch (Exception ignored) { } }
     private static long modified(Path path) { try { return Files.getLastModifiedTime(path).toMillis(); } catch (Exception ignored) { return 0; } }
-    public static CacheInfo getCacheInfo() { Path dir = cacheDir(); try (var files = Files.isDirectory(dir) ? Files.walk(dir) : java.util.stream.Stream.<Path>empty()) { var list = files.filter(Files::isRegularFile).filter(path -> !path.getFileName().toString().endsWith(".part")).toList(); return new CacheInfo(list.stream().mapToLong(VideoPlayer::size).sum(), list.size()); } catch (Exception ignored) { return new CacheInfo(0, 0); } }
-    public static long clearCache() { long deleted = 0; Path dir = cacheDir(); try (var files = Files.walk(dir)) { for (Path path : files.toList()) { if (path.getFileName().toString().endsWith(".part")) continue; AtomicInteger inUse = IN_USE.get(path); if (inUse != null && inUse.get() > 0) continue; if (Files.isRegularFile(path)) { long bytes = size(path); if (Files.deleteIfExists(path)) deleted += bytes; } } } catch (Exception ignored) { } READY.entrySet().removeIf(entry -> !Files.exists(entry.getValue())); IN_USE.entrySet().removeIf(entry -> !Files.exists(entry.getKey())); return deleted; }
+    public static CacheInfo getCacheInfo() { Path dir = cacheDir(); try (var files = Files.isDirectory(dir) ? Files.walk(dir) : java.util.stream.Stream.<Path>empty()) { var list = files.filter(Files::isRegularFile).toList(); return new CacheInfo(list.stream().mapToLong(VideoPlayer::size).sum(), list.size()); } catch (Exception ignored) { return new CacheInfo(0, 0); } }
+    public static long clearCache() { VideoPrefetcher.cancelAllAndWait(); long deleted = 0; Path dir = cacheDir(); try (var files = Files.isDirectory(dir) ? Files.walk(dir) : java.util.stream.Stream.<Path>empty()) { for (Path path : files.toList()) { AtomicInteger inUse = IN_USE.get(path); if (WRITING.containsKey(path) || inUse != null && inUse.get() > 0) continue; if (Files.isRegularFile(path)) { long bytes = size(path); if (Files.deleteIfExists(path)) deleted += bytes; } } } catch (Exception ignored) { } READY.entrySet().removeIf(entry -> !Files.exists(entry.getValue())); IN_USE.entrySet().removeIf(entry -> !Files.exists(entry.getKey())); return deleted; }
 }

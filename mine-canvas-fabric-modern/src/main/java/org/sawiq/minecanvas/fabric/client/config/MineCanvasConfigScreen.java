@@ -4,9 +4,12 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import net.fabricmc.loader.api.FabricLoader;
 import org.sawiq.minecanvas.fabric.client.video.VideoPlayer;
 import org.sawiq.minecanvas.fabric.client.video.VideoScreenManager;
 
+import java.awt.Desktop;
+import java.nio.file.Files;
 import java.util.List;
 
 public final class MineCanvasConfigScreen extends Screen {
@@ -20,6 +23,9 @@ public final class MineCanvasConfigScreen extends Screen {
     private int contentX;
     private int contentWidth;
     private ConfigWidgets.Cache cacheWidget;
+    private boolean cacheRefreshInFlight;
+    private boolean cacheClearInFlight;
+    private long nextCacheRefreshAt;
 
     public MineCanvasConfigScreen(Screen parent) {
         super(Component.translatable("config.minecanvas.title"));
@@ -67,9 +73,20 @@ public final class MineCanvasConfigScreen extends Screen {
                 Component.translatable("config.minecanvas.max_cache_gib"), ConfigWidgets.Icon.DOWNLOAD,
                 CACHE_LIMITS, nearestCacheLimit(config.maxCacheGiB), value -> value + " GiB", value -> config.maxCacheGiB = value));
         y += rowHeight + gap;
-        VideoPlayer.CacheInfo cache = VideoPlayer.getCacheInfo();
         cacheWidget = addRenderableWidget(new ConfigWidgets.Cache(contentX, y, contentWidth, rowHeight, font,
-                cache.fileCount(), cache.cacheSizeBytes(), this::clearVideoCache));
+                0, 0));
+        int controlsWidth = Math.min(170, Math.max(104, contentWidth / 2));
+        int clearWidth = Math.min(72, controlsWidth / 2);
+        int openWidth = controlsWidth - clearWidth - 3;
+        int controlsX = contentX + contentWidth - controlsWidth - 6;
+        int actionHeight = Math.max(1, Math.min(20, rowHeight - 6));
+        addRenderableWidget(new ConfigWidgets.Action(controlsX, y + (rowHeight - actionHeight) / 2,
+                openWidth, actionHeight, font,
+                Component.translatable("config.minecanvas.open_cache_folder"), false, this::openVideoCache));
+        addRenderableWidget(new ConfigWidgets.Action(controlsX + openWidth + 3,
+                y + (rowHeight - actionHeight) / 2, clearWidth, actionHeight,
+                font, Component.translatable("config.minecanvas.clear_cache"), false, this::clearVideoCache));
+        refreshCacheInfo();
 
         int doneHeight = Math.max(1, Math.min(22, footerHeight - 7));
         int doneY = panelY + panelHeight - doneHeight - 5;
@@ -116,14 +133,82 @@ public final class MineCanvasConfigScreen extends Screen {
     }
 
     private void clearVideoCache() {
+        if (cacheClearInFlight) return;
+        cacheClearInFlight = true;
+        cacheWidget.setClearing();
         Thread worker = new Thread(() -> {
             long freed = VideoPlayer.clearCache();
             Minecraft.getInstance().execute(() -> {
+                cacheClearInFlight = false;
                 VideoScreenManager.clearDeletePromptHistory();
                 VideoPlayer.CacheInfo cache = VideoPlayer.getCacheInfo();
                 cacheWidget.setInfo(cache.fileCount(), cache.cacheSizeBytes(), freed);
             });
         }, "MineCanvas-Cache-Clear");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void openVideoCache() {
+        Thread worker = new Thread(() -> {
+            boolean opened = false;
+            try {
+                var directory = FabricLoader.getInstance().getGameDir().resolve("mine-canvas-cache");
+                Files.createDirectories(directory);
+                opened = openCacheFolder(directory);
+            } catch (Exception ignored) { }
+            boolean result = opened;
+            Minecraft.getInstance().execute(() -> cacheWidget.setOpenResult(result));
+        }, "MineCanvas-Cache-Open");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private static boolean openCacheFolder(java.nio.file.Path directory) {
+        String target = directory.toAbsolutePath().toString();
+        String os = System.getProperty("os.name", "");
+        if (os.startsWith("Windows")) return openDesktop(directory) || start("explorer", target);
+        if (os.startsWith("Linux")) return start("xdg-open", target)
+                || start("/run/current-system/sw/bin/xdg-open", target) || start("gio", "open", target);
+        return openDesktop(directory) || os.startsWith("Mac") && start("open", target);
+    }
+
+    private static boolean openDesktop(java.nio.file.Path directory) {
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(directory.toFile());
+                return true;
+            }
+        } catch (Exception ignored) { }
+        return false;
+    }
+
+    private static boolean start(String... command) {
+        try {
+            new ProcessBuilder(command).start();
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (System.currentTimeMillis() >= nextCacheRefreshAt) refreshCacheInfo();
+    }
+
+    private void refreshCacheInfo() {
+        if (cacheRefreshInFlight) return;
+        cacheRefreshInFlight = true;
+        nextCacheRefreshAt = System.currentTimeMillis() + 1000L;
+        Thread worker = new Thread(() -> {
+            VideoPlayer.CacheInfo cache = VideoPlayer.getCacheInfo();
+            Minecraft.getInstance().execute(() -> {
+                cacheRefreshInFlight = false;
+                if (cacheWidget != null) cacheWidget.setInfo(cache.fileCount(), cache.cacheSizeBytes());
+            });
+        }, "MineCanvas-Cache-Info");
         worker.setDaemon(true);
         worker.start();
     }

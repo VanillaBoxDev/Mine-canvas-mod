@@ -124,28 +124,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
     // Пейсинг на render thread
     private volatile long playbackStartNs = 0; // время начала воспроизведения (из декодера или локальное)
 
-    // Состояние скачивания
-    private volatile boolean downloading = false;
-    private volatile int downloadPercent = 0;
-    private volatile long downloadedMb = 0;
-    private volatile long downloadTotalMb = 0;
-    private volatile long downloadedBytes = 0;
-    private volatile long downloadTotalBytes = 0;
-    private volatile long downloadStartWallMs = 0;
-    private volatile boolean resolvingPlatformVideo = false;
-    private volatile boolean downloadingYtdlp = false;
-    private volatile boolean downloadingPlatformVideo = false;
-    private volatile boolean downloadProgressReceived = false;
-    private volatile String downloadPhase = "";
-    /**
-     * Display label of the platform that the current download belongs to
-     * (e.g. {@code "RuTube"}, {@code "VK"}). Empty
-     * string when no platform-specific phase is active. The HUD feeds
-     * this into the {@code text.minecanvas.platform.*} lang strings as the
-     * first {@code %s} placeholder.
-     */
-    private volatile String platformLabel = "";
-
     public VideoScreen(ScreenState state) {
         this.state = state;
         lastSpatialAudioAvailable = SpatialAudio.isAvailable();
@@ -223,7 +201,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         durationMs = 0;
         lastHardResyncAtMs = 0;
         clearCachedFileInfo();
-        resetDownloadState();
         started = false;
         startedUrl = "";
         textureHasContent = false;
@@ -428,7 +405,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         frameQueueSize.set(0);
         buffering = true;
         playbackStartNs = 0;
-        resetDownloadState();
 
         if (!preserveEnded) {
             displayFrozen = false;
@@ -552,10 +528,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
     }
 
     public long currentPosMsForDisplay(long serverNowMs) {
-        // Во время скачивания показываем серверное время (таймлайн продолжает идти)
-        if (downloading) {
-            return currentVideoPosMs(serverNowMs);
-        }
         if (started && !ended && displayWallStartNs <= 0) {
             return currentVideoPosMs(serverNowMs);
         }
@@ -572,7 +544,7 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
     }
 
     private boolean shouldHardResync(long serverNowMs) {
-        if (!started || ended || downloading || displayFrozen) return false;
+        if (!started || ended || displayFrozen) return false;
         if (player == null || !player.isRunning()) return false;
         if (displayWallStartNs <= 0 || serverNowMs <= 0 || state.startEpochMs() <= 0) return false;
 
@@ -626,7 +598,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         displayFrozenPosMs = 0;
         displayStartPosMs = 0;
         displayWallStartNs = 0;
-        resetDownloadState();
 
         mutedByRadius = false;
         outOfRadiusSinceMs = 0;
@@ -722,7 +693,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         this.displayFrozen = true;
         this.displayFrozenPosMs = this.durationMs;
         this.displayWallStartNs = 0;
-        resetDownloadState();
 
         // Сервер сам определяет окончание видео по времени (безопаснее чем клиентское сообщение)
     }
@@ -767,16 +737,7 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         this.displayWallStartNs = wallStartNs;
         this.displayFrozen = false;
 
-        // Если было скачивание, учитываем время которое прошло
-        if (downloadStartWallMs > 0) {
-            long downloadDurationMs = System.currentTimeMillis() - downloadStartWallMs;
-            this.displayStartPosMs = this.displayFrozenPosMs + downloadDurationMs;
-            downloadStartWallMs = 0;
-        } else {
-            this.displayStartPosMs = this.displayFrozenPosMs;
-        }
-
-        resetDownloadState();
+        this.displayStartPosMs = this.displayFrozenPosMs;
     }
 
     @Override
@@ -796,87 +757,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
         }
     }
 
-    @Override
-    public void onDownloadStart(String message) {
-        String phase = normalizeDownloadPhase(message);
-        boolean samePhase = downloading && phase.equals(downloadPhase);
-
-        this.downloading = true;
-        if (!samePhase) {
-            this.downloadPercent = 0;
-            this.downloadedMb = 0;
-            this.downloadTotalMb = 0;
-            this.downloadedBytes = 0;
-            this.downloadTotalBytes = 0;
-            this.downloadProgressReceived = false;
-
-            // Запоминаем время начала скачивания для корректной синхронизации таймлайна
-            this.downloadStartWallMs = System.currentTimeMillis();
-        }
-        
-        // Track active platform phase for HUD label. Message keys follow
-        // "minecanvas.platform.<platform>_<phase>".
-        if (message != null) {
-            this.platformLabel = extractPlatformLabel(message);
-            boolean hasPlatform = !this.platformLabel.isEmpty();
-            this.resolvingPlatformVideo = hasPlatform;
-            this.downloadingYtdlp = message.contains("ytdlp");
-            this.downloadingPlatformVideo = hasPlatform
-                && (message.contains("_downloading"));
-        } else {
-            this.platformLabel = "";
-            this.resolvingPlatformVideo = false;
-            this.downloadingYtdlp = false;
-            this.downloadingPlatformVideo = false;
-        }
-        this.downloadPhase = phase;
-    }
-
-    /**
-     * Returns the display label for the platform encoded in the given
-     * download message, or an empty string for messages that don't name
-     * a platform (generic downloads, yt-dlp installer, etc.).
-     */
-    private static String extractPlatformLabel(String message) {
-        if (message == null) return "";
-        if (message.contains("rutube")) return "RuTube";
-        if (message.contains("vk_")) return "VK";
-        if (message.contains("video_")) return "Video";
-        return "";
-    }
-
-    @Override
-    public void onDownloadProgress(int percent, long downloadedMb, long totalMb) {
-        this.downloadPercent = Math.max(this.downloadPercent, Math.max(0, percent));
-        this.downloadedMb = Math.max(this.downloadedMb, Math.max(0L, downloadedMb));
-        this.downloadTotalMb = Math.max(this.downloadTotalMb, Math.max(0L, totalMb));
-        this.downloadProgressReceived = true;
-    }
-
-    @Override
-    public void onDownloadProgressBytes(int percent, long downloadedBytes, long totalBytes) {
-        this.downloadPercent = Math.max(this.downloadPercent, Math.max(0, percent));
-        this.downloadedBytes = Math.max(this.downloadedBytes, Math.max(0L, downloadedBytes));
-        this.downloadTotalBytes = Math.max(this.downloadTotalBytes, Math.max(0L, totalBytes));
-        this.downloadedMb = Math.max(this.downloadedMb, Math.round(this.downloadedBytes / 1048576.0));
-        this.downloadTotalMb = Math.max(this.downloadTotalMb, Math.round(this.downloadTotalBytes / 1048576.0));
-        this.downloadProgressReceived = true;
-    }
-
-    // Геттеры для состояния скачивания (для отображения в HUD)
-    public boolean isDownloading() { return downloading; }
-    public int getDownloadPercent() { return downloadPercent; }
-    public long getDownloadedMb() { return downloadedMb; }
-    public long getDownloadTotalMb() { return downloadTotalMb; }
-    public long getDownloadedBytes() { return downloadedBytes; }
-    public long getDownloadTotalBytes() { return downloadTotalBytes; }
-    public boolean isResolvingPlatformVideo() { return resolvingPlatformVideo; }
-    public boolean isDownloadingYtdlp() { return downloadingYtdlp; }
-    public boolean isDownloadingPlatformVideo() { return downloadingPlatformVideo; }
-    public boolean hasDownloadProgressReceived() { return downloadProgressReceived; }
-    /** @return display label of active platform download, or empty string. */
-    public String getPlatformLabel() { return platformLabel; }
-
     // Рнформация о кэшированном файле (для предложения удаления)
     private volatile String cachedFilePath = null;
     private volatile long cachedFileSizeBytes = 0;
@@ -893,43 +773,6 @@ public final class VideoScreen implements VideoPlayer.FrameSink {
     private void clearCachedFileInfo() {
         this.cachedFilePath = null;
         this.cachedFileSizeBytes = 0;
-    }
-
-    private void resetDownloadState() {
-        this.downloading = false;
-        this.downloadPercent = 0;
-        this.downloadedMb = 0;
-        this.downloadTotalMb = 0;
-        this.downloadedBytes = 0;
-        this.downloadTotalBytes = 0;
-        this.downloadStartWallMs = 0;
-        this.resolvingPlatformVideo = false;
-        this.downloadingYtdlp = false;
-        this.downloadingPlatformVideo = false;
-        this.downloadProgressReceived = false;
-        this.downloadPhase = "";
-        this.platformLabel = "";
-    }
-
-    private static String normalizeDownloadPhase(String message) {
-        if (message == null || message.isBlank()) {
-            return "";
-        }
-        // Distinct phases per platform so switching between platform prepares
-        // does not falsely count as the "same phase"
-        // (which would suppress the progress reset in onDownloadStart).
-        if (message.contains("_downloading")) {
-            if (message.contains("rutube")) return "rutube_download";
-            if (message.contains("vk_")) return "vk_download";
-            if (message.contains("video_")) return "video_download";
-            return "generic_download";
-        }
-        if (message.contains("ytdlp")) {
-            return "ytdlp";
-        }
-        if (message.contains("rutube")) return "rutube_prepare";
-        if (message.contains("vk_")) return "vk_prepare";
-        return "generic";
     }
 
     // Геттер для проверки окончания видео (показывать "Сеанс окончен" в течение 5 секунд)

@@ -31,7 +31,9 @@ public final class VideoScreenManager {
     private static final int GREEN = 0x00FF00;
     private static final int GRAY = 0xAAAAAA;
     private static final int YELLOW = 0xFFFF55;
-    private static final Component PREFIX = Component.translatable("text.minecanvas.prefix").setStyle(Style.EMPTY.withColor(GREEN));
+    private static final class Components {
+        private static final Component PREFIX = Component.translatable("text.minecanvas.prefix").setStyle(Style.EMPTY.withColor(GREEN));
+    }
 
     private static volatile long lastActionbarUpdateMs = 0;
     private static volatile String lastClientWorldKey = "";
@@ -208,51 +210,8 @@ public final class VideoScreenManager {
     }
 
     private static MutableComponent buildActionBarText(VideoScreen nearest, long serverNowMs) {
-        int pct = Math.max(0, nearest.getDownloadPercent());
-        long dlMb = Math.max(0L, nearest.getDownloadedMb());
-        long totalMb = Math.max(0L, nearest.getDownloadTotalMb());
-        long downloadedBytes = Math.max(0L, nearest.getDownloadedBytes());
-        long totalBytes = Math.max(0L, nearest.getDownloadTotalBytes());
         VideoPrefetcher.Status prefetch = VideoPrefetcher.status(nearest.state().name());
-        boolean waitingForPrefetch = !nearest.hasDownloadProgressReceived()
-            && prefetch.state() == VideoPrefetcher.State.DOWNLOADING;
-        if (waitingForPrefetch) {
-            pct = Math.max(0, prefetch.percent());
-            dlMb = Math.max(0L, prefetch.downloadedMb());
-            totalMb = Math.max(0L, prefetch.totalMb());
-            downloadedBytes = Math.max(0L, prefetch.downloadedBytes());
-            totalBytes = Math.max(0L, prefetch.totalBytes());
-        }
-
-        if (nearest.isDownloadingYtdlp()) {
-            return Component.translatable("text.minecanvas.tools.installing_progress", pct).setStyle(Style.EMPTY.withColor(YELLOW));
-        }
-        String platform = nearest.getPlatformLabel();
-        String leader = platform.isBlank() ? nearest.state().name() : platform;
-        boolean downloadingPlatformVideo = nearest.isDownloadingPlatformVideo() || waitingForPrefetch;
-        String downloaded = formatDownloadSize(downloadedBytes, dlMb);
-        String total = formatDownloadSize(totalBytes, totalMb);
-        if (downloadingPlatformVideo && (totalBytes > 0 || totalMb > 0)) {
-            return Component.translatable("text.minecanvas.platform.download.progress_size", leader, pct, downloaded, total).setStyle(Style.EMPTY.withColor(YELLOW));
-        }
-        if (downloadingPlatformVideo && (downloadedBytes > 0 || dlMb > 0)) {
-            return Component.translatable("text.minecanvas.platform.download.size", leader, downloaded).setStyle(Style.EMPTY.withColor(YELLOW));
-        }
-        if (downloadingPlatformVideo) {
-            return Component.translatable("text.minecanvas.platform.preparing", leader).setStyle(Style.EMPTY.withColor(YELLOW));
-        }
-        if (nearest.isResolvingPlatformVideo()) {
-            return Component.translatable("text.minecanvas.platform.preparing", leader).setStyle(Style.EMPTY.withColor(YELLOW));
-        }
-        if (nearest.isDownloading() || waitingForPrefetch) {
-            if (totalBytes > 0 || totalMb > 0) {
-                return Component.translatable("text.minecanvas.prefetch.progress_size", nearest.state().name(), pct, downloaded, total)
-                    .setStyle(Style.EMPTY.withColor(YELLOW));
-            }
-            if (downloadedBytes > 0 || dlMb > 0) {
-                return Component.translatable("text.minecanvas.prefetch.size", nearest.state().name(), downloaded).setStyle(Style.EMPTY.withColor(YELLOW));
-            }
-        }
+        if (prefetch.state() == VideoPrefetcher.State.DOWNLOADING) return downloadHud(nearest.state().name(), prefetch);
         long posMs = nearest.currentPosMsForDisplay(serverNowMs);
         long durMs = nearest.durationMs();
         if (durMs > 0) {
@@ -276,7 +235,7 @@ public final class VideoScreenManager {
         SHOWN_DELETE_PROMPT.add(screenKey);
         long sizeMb = nearest.getCachedFileSizeMb();
 
-        VideoPlatformBridge.systemMessage(player, PREFIX.copy()
+        VideoPlatformBridge.systemMessage(player, Components.PREFIX.copy()
             .append(Component.translatable("text.minecanvas.video.session_finished_cache", sizeMb).setStyle(Style.EMPTY.withColor(GRAY)))
             .append(Component.literal("\n"))
             .append(Component.translatable("text.minecanvas.video.cache_config_hint").setStyle(Style.EMPTY.withColor(YELLOW))));
@@ -343,26 +302,15 @@ public final class VideoScreenManager {
                     } else if (nearest.hasEnded()) {
                         VideoPlatformBridge.overlayMessage(p, Component.literal(""));
                     } else {
-                        VideoPlatformBridge.overlayMessage(p, PREFIX.copy().append(buildActionBarText(nearest, serverNowMs)));
+                        VideoPlatformBridge.overlayMessage(p, Components.PREFIX.copy().append(buildActionBarText(nearest, serverNowMs)));
                     }
                 } else {
                     VideoScreen idle = findNearestPrefetchStatusInRadius(pos, VideoPrefetcher.PREFETCH_RADIUS_BLOCKS);
                     VideoPrefetcher.Status prefetch = idle == null ? null : VideoPrefetcher.status(idle.state().name());
                     if (prefetch != null && prefetch.state() == VideoPrefetcher.State.DOWNLOADING) {
-                        String downloaded = formatDownloadSize(prefetch.downloadedBytes(), prefetch.downloadedMb());
-                        if (prefetch.totalBytes() > 0 || prefetch.totalMb() > 0) {
-                            VideoPlatformBridge.overlayMessage(p, PREFIX.copy().append(Component.translatable("text.minecanvas.prefetch.progress_size",
-                                idle.state().name(), prefetch.percent(), downloaded,
-                                formatDownloadSize(prefetch.totalBytes(), prefetch.totalMb())).setStyle(Style.EMPTY.withColor(YELLOW))));
-                        } else if (prefetch.downloadedBytes() > 0 || prefetch.downloadedMb() > 0) {
-                            VideoPlatformBridge.overlayMessage(p, PREFIX.copy().append(Component.translatable("text.minecanvas.prefetch.size",
-                                idle.state().name(), downloaded).setStyle(Style.EMPTY.withColor(YELLOW))));
-                        } else {
-                            VideoPlatformBridge.overlayMessage(p, PREFIX.copy().append(Component.translatable("text.minecanvas.prefetch.preparing",
-                                idle.state().name()).setStyle(Style.EMPTY.withColor(YELLOW))));
-                        }
+                        VideoPlatformBridge.overlayMessage(p, Components.PREFIX.copy().append(downloadHud(idle.state().name(), prefetch)));
                     } else if (prefetch != null && prefetch.state() == VideoPrefetcher.State.READY) {
-                        VideoPlatformBridge.overlayMessage(p, PREFIX.copy().append(Component.translatable("text.minecanvas.prefetch.ready",
+                        VideoPlatformBridge.overlayMessage(p, Components.PREFIX.copy().append(Component.translatable("text.minecanvas.prefetch.ready",
                             idle.state().name()).setStyle(Style.EMPTY.withColor(GREEN))));
                     }
                 }
@@ -396,11 +344,25 @@ public final class VideoScreenManager {
         return best;
     }
 
-    private static String formatDownloadSize(long bytes, long megabytes) {
+    private static MutableComponent downloadHud(String name, VideoPrefetcher.Status status) {
+        String downloaded = formatDownloadSize(status.downloadedBytes(), status.downloadedMb());
+        MutableComponent text = status.totalBytes() > 0 || status.totalMb() > 0
+            ? Component.translatable("text.minecanvas.prefetch.progress_size", name, status.percent(), downloaded,
+                formatDownloadSize(status.totalBytes(), status.totalMb()))
+            : Component.translatable("text.minecanvas.prefetch.size", name, downloaded);
+        return text.append(Component.literal(" • " + formatSpeed(status.bytesPerSecond()))).setStyle(Style.EMPTY.withColor(YELLOW));
+    }
+
+    static String formatDownloadSize(long bytes, long megabytes) {
+        if (bytes == 0) return megabytes > 0 ? megabytes + " MB" : "0 B";
         if (bytes > 0 && bytes < 1048576L) return Math.max(1L, Math.round(bytes / 1024.0)) + " KB";
         if (bytes > 0 && bytes < 10L * 1048576L) return String.format(Locale.ROOT, "%.1f MB", bytes / 1048576.0);
         if (bytes > 0) return Math.round(bytes / 1048576.0) + " MB";
         return megabytes + " MB";
+    }
+
+    static String formatSpeed(long bytesPerSecond) {
+        return formatDownloadSize(Math.max(0L, bytesPerSecond), 0) + "/s";
     }
 
     public static long estimateServerNowMs() {

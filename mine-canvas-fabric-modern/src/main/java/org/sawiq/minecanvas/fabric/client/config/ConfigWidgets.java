@@ -482,16 +482,22 @@ final class ConfigWidgets {
 
     static final class Cache extends Row {
         private static final long GIB = 1024L * 1024L * 1024L;
-        private final Runnable clear;
         private int fileCount;
         private long sizeBytes;
         private long clearedBytes;
         private long noteUntil;
         private boolean clearing;
+        private Boolean opened;
 
-        Cache(int x, int y, int width, int height, Font font, int fileCount, long sizeBytes, Runnable clear) {
+        Cache(int x, int y, int width, int height, Font font, int fileCount, long sizeBytes) {
             super(x, y, width, height, font, Component.translatable("config.minecanvas.cache"), Icon.CACHE);
-            this.clear = clear;
+            active = false;
+            this.fileCount = fileCount;
+            this.sizeBytes = sizeBytes;
+            updateMessage();
+        }
+
+        void setInfo(int fileCount, long sizeBytes) {
             this.fileCount = fileCount;
             this.sizeBytes = sizeBytes;
             updateMessage();
@@ -503,7 +509,18 @@ final class ConfigWidgets {
             this.clearedBytes = clearedBytes;
             noteUntil = System.currentTimeMillis() + 3000L;
             clearing = false;
-            active = true;
+            updateMessage();
+        }
+
+        void setClearing() {
+            clearing = true;
+            opened = null;
+            updateMessage();
+        }
+
+        void setOpenResult(boolean opened) {
+            this.opened = opened;
+            noteUntil = System.currentTimeMillis() + 3000L;
             updateMessage();
         }
 
@@ -511,6 +528,8 @@ final class ConfigWidgets {
         Component displayedLabel() {
             if (clearing) return Component.translatable("config.minecanvas.cache_clearing");
             if (System.currentTimeMillis() < noteUntil) {
+                if (opened != null) return Component.translatable(opened
+                        ? "config.minecanvas.cache_opened" : "config.minecanvas.cache_open_failed");
                 return Component.translatable("config.minecanvas.cache_cleared", formatSize(clearedBytes));
             }
             return Component.translatable("config.minecanvas.cache_summary", fileCount, formatSize(sizeBytes));
@@ -526,48 +545,21 @@ final class ConfigWidgets {
         }
 
         private void updateMessage() {
-            setMessage(displayedLabel().copy()
-                    .append("; ").append(Component.translatable("config.minecanvas.clear_cache")));
+            setMessage(displayedLabel());
         }
 
         @Override
         int controlLeft() {
-            return Math.max(getRight() - Math.min(92, Math.max(66, getWidth() / 4)) - 6, getX() + 28);
+            return Math.max(getRight() - Math.min(170, Math.max(104, getWidth() / 2)) - 6, getX() + 28);
         }
 
         @Override
         void drawControl(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
-            int width = getRight() - controlLeft() - 6;
-            int height = Math.min(20, getHeight() - 6);
-            int y = getY() + (getHeight() - height) / 2;
-            boolean hovered = mouseX >= controlLeft() && mouseX < getRight() - 6
-                    && mouseY >= getY() && mouseY < getBottom();
-            int fill = clearing ? 0xFFBFA3B6 : hovered || isFocused() ? 0xFFE4AAB4 : ACCENT;
-            roundedBorder(graphics, controlLeft(), y, width, height, 0xFFB77C8A, fill);
-            Component text = Component.translatable("config.minecanvas.clear_cache");
-            graphics.text(font, text, controlLeft() + (width - font.width(text)) / 2,
-                    getY() + (getHeight() - font.lineHeight) / 2, 0xFFFFFFFF, true);
         }
 
         @Override
-        public void onClick(MouseButtonEvent event, boolean doubleClick) {
-            startClearing();
-        }
-
-        @Override
-        public boolean keyPressed(KeyEvent event) {
-            if (clearing || !event.isSelection()) return false;
-            playDownSound(Minecraft.getInstance().getSoundManager());
-            startClearing();
-            return true;
-        }
-
-        private void startClearing() {
-            if (clearing) return;
-            clearing = true;
-            active = false;
-            updateMessage();
-            clear.run();
+        boolean overControl(double mouseX, double mouseY) {
+            return false;
         }
     }
 

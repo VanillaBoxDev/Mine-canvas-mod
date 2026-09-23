@@ -15,11 +15,12 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
@@ -31,28 +32,8 @@ import java.util.zip.ZipInputStream;
 public final class PlatformResolver {
     private static final String META_PREFIX = "MineCanvasMeta:";
 
-    /**
-     * Live set of yt-dlp / ffmpeg subprocesses so a stale prefetch can be
-     * aborted. Without this an abandoned prefetch kept running for up to 30
-     * minutes (its waitFor timeout), holding native pipes and the single
-     * MineCanvas-Prefetch worker, which blocked prefetch for other screens.
-     * Membership is bounded by the number of in-flight downloads.
-     */
-    private static final Set<Process> ACTIVE_DOWNLOAD_PROCESSES = ConcurrentHashMap.newKeySet();
     private static final java.util.Map<String, DownloadLock> DOWNLOAD_LOCKS = new ConcurrentHashMap<>();
     private static final class DownloadLock { private int users; }
-
-    /**
-     * Forcibly terminates every in-flight yt-dlp / ffmpeg subprocess.
-     * Partial artifacts are kept so a later attempt can resume them.
-     * Idempotent and safe to call from any thread. Each process evicts itself
-     * from the registry in its own finally block, so this does not clear().
-     */
-    static void cancelPrefetchDownloads() {
-        for (Process p : ACTIVE_DOWNLOAD_PROCESSES.toArray(new Process[0])) {
-            p.destroyForcibly();
-        }
-    }
 
     private static final Pattern DOWNLOAD_PROGRESS_PATTERN = Pattern.compile(".*?(\\d{1,3}(?:\\.\\d+)?)%.*?of\\s+~?\\s*(\\d+(?:\\.\\d+)?)(?:\\s*)(B|KiB|MiB|GiB|TiB).*");
     private static final Pattern DOWNLOAD_PERCENT_PATTERN = Pattern.compile(".*?(\\d{1,3}(?:\\.\\d+)?)%.*");
@@ -338,7 +319,8 @@ public final class PlatformResolver {
         };
     }
 
-    static PlatformResult resolvePrefetch(String url, int preferredHeight, VideoPlayer.FrameSink sink) {
+    static PlatformResult resolvePrefetch(String url, int preferredHeight, VideoPlayer.FrameSink sink,
+                                          BooleanSupplier cancelled, Consumer<Runnable> setAbort) {
         url = normalizeVkLiveUrl(url);
         if (url == null || url.isBlank()) {
             return new PlatformResult(null, null, 0, "Empty URL", false);
@@ -388,7 +370,8 @@ public final class PlatformResolver {
         }
 
         try {
-            StreamMeta meta = resolveStreamMeta(url);
+            if (cancelled.getAsBoolean()) return new PlatformResult(null, sourceId, 0, "Cancelled", false);
+            StreamMeta meta = resolveStreamMeta(url, cancelled, setAbort);
             if ((meta.sourceId() != null) && !meta.sourceId().isBlank()) {
                 sourceId = meta.sourceId();
             }
@@ -418,7 +401,8 @@ public final class PlatformResolver {
                 return new PlatformResult(null, sourceId, 0, "ffmpeg not available", true);
             }
 
-            return downloadVodToCache(platform, url, sourceId, targetHeight, sink);
+            if (cancelled.getAsBoolean()) return new PlatformResult(null, sourceId, 0, "Cancelled", false);
+            return downloadVodToCache(platform, url, sourceId, targetHeight, sink, cancelled, setAbort);
         } catch (Exception e) {
             dbg("resolve: metadata error " + e.getMessage());
 
@@ -591,7 +575,8 @@ public final class PlatformResolver {
                                                       String sourceUrl,
                                                       String sourceId,
                                                       int preferredHeight,
-                                                      VideoPlayer.FrameSink sink) throws Exception {
+                                                      VideoPlayer.FrameSink sink, BooleanSupplier cancelled,
+                                                      Consumer<Runnable> setAbort) throws Exception {
         int targetHeight = normalizeTargetHeight(preferredHeight);
         String key = platform + ":" + cacheKey(sourceId, targetHeight);
         DownloadLock lock = DOWNLOAD_LOCKS.compute(key, (ignored, current) -> {
@@ -601,6 +586,7 @@ public final class PlatformResolver {
         });
         try {
             synchronized (lock) {
+                if (cancelled.getAsBoolean()) return new PlatformResult(null, sourceId, 0, "Cancelled", false);
                 Path cacheDir = getPlatformCacheDir(platform);
                 Path cachedFile = findCachedFile(cacheDir, sourceId, targetHeight);
                 if (cachedFile != null) {
@@ -609,7 +595,7 @@ public final class PlatformResolver {
                     notifyCachedFileUsed(cachedFile, sink);
                     return new PlatformResult(cachedFile.toString(), sourceId, durationMs, null, false);
                 }
-                return downloadVodToCacheLocked(platform, sourceUrl, sourceId, targetHeight, sink);
+                return downloadVodToCacheLocked(platform, sourceUrl, sourceId, targetHeight, sink, cancelled, setAbort);
             }
         } finally {
             DOWNLOAD_LOCKS.computeIfPresent(key, (ignored, current) -> {
@@ -623,7 +609,8 @@ public final class PlatformResolver {
                                                            String sourceUrl,
                                                            String sourceId,
                                                            int preferredHeight,
-                                                           VideoPlayer.FrameSink sink) throws Exception {
+                                                           VideoPlayer.FrameSink sink, BooleanSupplier cancelled,
+                                                           Consumer<Runnable> setAbort) throws Exception {
         int targetHeight = normalizeTargetHeight(preferredHeight);
         Path cacheDir = getPlatformCacheDir(platform);
         Files.createDirectories(cacheDir);
@@ -698,7 +685,7 @@ public final class PlatformResolver {
         }
 
         Process p = pb.start();
-        ACTIVE_DOWNLOAD_PROCESSES.add(p);
+        setAbort.accept(p::destroyForcibly);
         StringBuilder output = new StringBuilder();
         String finalPath = null;
         long durationMs = 0L;
@@ -712,86 +699,65 @@ public final class PlatformResolver {
             progressMonitor.start();
         }
 
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append('\n');
-                String trimmed = line.trim();
-                if (trimmed.startsWith("before_dl:MineCanvasMeta:")) {
-                    updatePrintedDownloadSize(trimmed, totalEstimateBytes);
-                    // Surface the total size to the HUD the moment yt-dlp
-                    // announces it (pre-transfer), so the progress line
-                    // flips from "preparing..." to "X: 0% (0 MB / Y MB)"
-                    // without waiting for the first progress tick. The
-                    // Math.max merge in VideoScreen.onDownloadProgress
-                    // protects against later "audio-only" announcements
-                    // shrinking the displayed total.
-                    if (sink != null) {
-                        long announcedBytes = totalEstimateBytes.get();
-                        if (announcedBytes > 0) {
-                            sink.onDownloadProgressBytes(0, 0L, announcedBytes);
+        try {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append('\n');
+                    String trimmed = line.trim();
+                    if (trimmed.startsWith("before_dl:MineCanvasMeta:")) {
+                        updatePrintedDownloadSize(trimmed, totalEstimateBytes);
+                        if (sink != null) {
+                            long announcedBytes = totalEstimateBytes.get();
+                            if (announcedBytes > 0) sink.onDownloadProgressBytes(0, 0L, announcedBytes);
                         }
                     }
-                }
-                if (sink != null) {
-                    updateDownloadProgressFromYtdlp(trimmed, sink, totalEstimateBytes);
-                }
-                if (trimmed.startsWith("after_move:")) {
-                    finalPath = trimmed.substring("after_move:".length()).trim();
-                } else if (durationMs == 0L) {
-                    durationMs = parseDuration(trimmed);
+                    if (sink != null) updateDownloadProgressFromYtdlp(trimmed, sink, totalEstimateBytes);
+                    if (trimmed.startsWith("after_move:")) finalPath = trimmed.substring("after_move:".length()).trim();
+                    else if (durationMs == 0L) durationMs = parseDuration(trimmed);
                 }
             }
-        }
 
-        boolean finished;
-        try {
-            finished = p.waitFor(30, TimeUnit.MINUTES);
+            boolean finished = p.waitFor(30, TimeUnit.MINUTES);
+            monitorRunning.set(false);
+            if (progressMonitor != null) {
+                progressMonitor.interrupt();
+                try {
+                    progressMonitor.join(1500L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (!finished) {
+                p.destroyForcibly();
+                return new PlatformResult(null, sourceId, 0, "yt-dlp timeout while downloading video", false);
+            }
+
+            if (p.exitValue() != 0) {
+                String err = output.toString().trim();
+                if (err.length() > 300) err = err.substring(0, 300) + "...";
+                return new PlatformResult(null, sourceId, 0, "yt-dlp download error: " + err, false);
+            }
+
+            Path finalFile = null;
+            if (finalPath != null && !finalPath.isBlank()) {
+                Path candidate = Path.of(finalPath);
+                if (Files.isRegularFile(candidate)) finalFile = candidate;
+            }
+            if (finalFile == null) finalFile = findCachedFile(cacheDir, sourceId, targetHeight);
+            if (finalFile == null) return new PlatformResult(null, sourceId, 0, "Downloaded file not found", false);
+
+            writeCachedDuration(cacheDir, sourceId, durationMs);
+            URL_CACHE.put(cacheKey(sourceId, targetHeight), new ResolvedUrl(finalFile.toString(), sourceId, System.currentTimeMillis(), durationMs));
+            notifyCachedFileUsed(finalFile, sink);
+            dbg("downloadVodToCache: platform=" + platform + " cached file=" + finalFile);
+            return new PlatformResult(finalFile.toString(), sourceId, durationMs, null, false);
         } finally {
-            // Always evict from the active-process registry so that a later
-            // Registry cleanup does not touch an already-dead process.
-            // pid (typically harmless but creates noisy logs on some JDKs).
-            ACTIVE_DOWNLOAD_PROCESSES.remove(p);
+            monitorRunning.set(false);
+            if (progressMonitor != null) progressMonitor.interrupt();
+            setAbort.accept(null);
+            if (p.isAlive()) p.destroyForcibly();
         }
-        monitorRunning.set(false);
-        if (progressMonitor != null) {
-            progressMonitor.interrupt();
-            try {
-                progressMonitor.join(1500L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        if (!finished) {
-            p.destroyForcibly();
-            return new PlatformResult(null, sourceId, 0, "yt-dlp timeout while downloading video", false);
-        }
-
-        if (p.exitValue() != 0) {
-            String err = output.toString().trim();
-            if (err.length() > 300) err = err.substring(0, 300) + "...";
-            return new PlatformResult(null, sourceId, 0, "yt-dlp download error: " + err, false);
-        }
-
-        Path finalFile = null;
-        if (finalPath != null && !finalPath.isBlank()) {
-            Path candidate = Path.of(finalPath);
-            if (Files.isRegularFile(candidate)) {
-                finalFile = candidate;
-            }
-        }
-        if (finalFile == null) {
-            finalFile = findCachedFile(cacheDir, sourceId, targetHeight);
-        }
-        if (finalFile == null) {
-            return new PlatformResult(null, sourceId, 0, "Downloaded file not found", false);
-        }
-
-        writeCachedDuration(cacheDir, sourceId, durationMs);
-        URL_CACHE.put(cacheKey(sourceId, targetHeight), new ResolvedUrl(finalFile.toString(), sourceId, System.currentTimeMillis(), durationMs));
-        notifyCachedFileUsed(finalFile, sink);
-        dbg("downloadVodToCache: platform=" + platform + " cached file=" + finalFile);
-        return new PlatformResult(finalFile.toString(), sourceId, durationMs, null, false);
     }
 
     private static void notifyCachedFileUsed(Path file, VideoPlayer.FrameSink sink) {
@@ -828,7 +794,7 @@ public final class PlatformResolver {
                 // formats (RuTube HLS, certain VK clips). Scale the
                 // already-downloaded bytes by the fragment ratio to get
                 // a usable total estimate. Refines on every tick as more
-                // fragments arrive; VideoScreen.onDownloadProgress takes
+                // fragments arrive; VideoPrefetcher progress takes
                 // a Math.max so the displayed total never shrinks.
                 if (totalBytesFinal <= 0 && fragmentCount > 0 && fragmentIndex > 0 && downloadedBytes > 0) {
                     totalBytesFinal = Math.round((double) downloadedBytes * fragmentCount / fragmentIndex);
@@ -938,11 +904,12 @@ public final class PlatformResolver {
     private record ProcessResult(int exitCode, boolean timedOut, String output) {
     }
 
-    private static ProcessResult runYtdlpCommand(List<String> command, long timeout, TimeUnit unit, String threadName) throws Exception {
+    private static ProcessResult runYtdlpCommand(List<String> command, long timeout, TimeUnit unit, String threadName,
+                                                 BooleanSupplier cancelled, Consumer<Runnable> setAbort) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.redirectErrorStream(true);
         Process process = pb.start();
-        ACTIVE_DOWNLOAD_PROCESSES.add(process);
+        setAbort.accept(process::destroyForcibly);
 
         StringBuilder output = new StringBuilder();
         Thread readerThread = new Thread(() -> {
@@ -959,9 +926,10 @@ public final class PlatformResolver {
 
         boolean finished;
         try {
+            if (cancelled.getAsBoolean()) process.destroyForcibly();
             finished = process.waitFor(timeout, unit);
         } finally {
-            ACTIVE_DOWNLOAD_PROCESSES.remove(process);
+            setAbort.accept(null);
         }
 
         if (!finished) {
@@ -981,7 +949,8 @@ public final class PlatformResolver {
         return new ProcessResult(finished ? process.exitValue() : -1, !finished, output.toString());
     }
 
-    private static StreamMeta resolveStreamMeta(String url) throws Exception {
+    private static StreamMeta resolveStreamMeta(String url, BooleanSupplier cancelled,
+                                                Consumer<Runnable> setAbort) throws Exception {
         List<String> command = new ArrayList<>();
         command.add(getYtdlpPath().toString());
         command.add("--print");
@@ -1000,7 +969,7 @@ public final class PlatformResolver {
         command.add("1");
         command.add(url);
 
-        ProcessResult result = runYtdlpCommand(command, 15, TimeUnit.SECONDS, "MineCanvas-YTDLP-Meta");
+        ProcessResult result = runYtdlpCommand(command, 15, TimeUnit.SECONDS, "MineCanvas-YTDLP-Meta", cancelled, setAbort);
         String output = result.output();
         StreamMeta meta = null;
         for (String line : output.split("\\R")) {
